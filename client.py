@@ -1,18 +1,40 @@
-import rsa
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 import socket
 import threading
+import base64
 
 # Manejar conexion y envio de llaves
-public_key, private_key = rsa.newkeys(1024)
+private_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=4096,
+    backend=default_backend()
+)
+public_key = private_key.public_key()
+
 public_partner = None
 
 # Conexion con server
 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 client.connect(("localhost", 9999))
 
-# Verificacion con llave publica
-public_partner = rsa.PublicKey.load_pkcs1(client.recv(1024))
-client.send(public_key.save_pkcs1("PEM"))
+# Se prepara PEM de llave publica
+public_pem = public_key.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo
+)
+
+# Se envia llave publica a cliente
+client.send(public_pem)
+
+# Carga llave publica de cliente
+public_partner = serialization.load_pem_public_key(
+        client.recv(1024),
+        backend=default_backend()
+    )
 
 def main():
     print("Bienvenido a Securechat 1.0")
@@ -28,24 +50,37 @@ def main():
 # Maneja comportamiento para recibir mensajes
 def receiving_messages(c):
     while True:
-        msg = rsa.decrypt(c.recv(1024), private_key).decode()
-        if msg == "salir":
-            print("Cliente desconectado")
-            c.send(rsa.encrypt("salir".encode(), public_partner))
+        msg = c.recv(1024)
+        decrypted = private_key.decrypt(base64.b64decode(msg),
+                                        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                     algorithm=hashes.SHA256(),
+                                                     label=None
+                                                     )
+                                        )
+        decrypted_str = decrypted.decode()
+        if decrypted_str == "salir":
+            print("Alice se ha desconectado")
+            c.send("salir".encode())
             break
         print()
-        print("Alice: " + msg)
+        print("Alice: " + decrypted_str)
 
 # Maneja envio de mensajes
 def sending_messages(c):
     while True:
         print()
         message = input("Yo: ")
+        encrypted = base64.b64encode(public_partner.encrypt(message.encode(),
+                                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                                  algorithm=hashes.SHA256(),
+                                                                  label=None)
+                                                                  )
+                                     )
         if message.lower() == "salir":
-            c.send(rsa.encrypt(message.encode(), public_partner))
+            c.send(encrypted)
             break
 
-        c.send(rsa.encrypt(message.encode(), public_partner))
+        c.send(encrypted)
 
 if __name__ == "__main__":
     main()
