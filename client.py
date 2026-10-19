@@ -41,6 +41,20 @@ def main():
     print("Escribe tu mensaje o 'salir' para terminar")
     print("Alice se ha conectado")
 
+    # Handshake
+    encrypted = base64.b64encode(public_partner.encrypt(b'hello',
+                                padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                              algorithm=hashes.SHA256(),
+                                                              label=None)
+                                                             )
+                                 )
+
+    try:
+        client.send(encrypted)
+    except Exception as e:
+        print(f"Error {e}")
+
+    # Hilos para enviar mensajes
     send_thread = threading.Thread(target=sending_messages, args=(client,))
     recv_thread = threading.Thread(target=receiving_messages, args=(client,))
     send_thread.start()

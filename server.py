@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 import socket
 import threading
 import base64
+import sys
 
 # Manejar conexion y envio de llaves
 private_key = rsa.generate_private_key(
@@ -46,12 +47,27 @@ def main():
     print("Escribe tu mensaje o 'salir' para terminar")
     print("Bob se ha conectado")
 
+    # Handshake
+    handshake = client.recv(1024)
+    decrypted = private_key.decrypt(base64.b64decode(handshake),
+                                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                 algorithm=hashes.SHA256(),
+                                                 label=None
+                                                 )
+                                    )
+    if decrypted.decode() != "hello":
+        print("Error: handshake fallido")
+        sys.exit(1)
+
+    # Hilos para enviar mensajes
     send_thread = threading.Thread(target=sending_messages, args=(client,))
     recv_thread = threading.Thread(target=receiving_messages, args=(client,))
     send_thread.start()
     recv_thread.start()
     send_thread.join()
     recv_thread.join()
+
+
 
 # Maneja comportamiento para recibir mensajes
 def receiving_messages(c):
