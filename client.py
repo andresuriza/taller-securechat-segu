@@ -1,11 +1,16 @@
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
+from Cryptodome.Cipher import AES
+from Cryptodome.Protocol.KDF import scrypt
+from Cryptodome.Util.number import long_to_bytes
 import socket
 import threading
 import base64
+import sys
 
 # Manejar conexion y envio de llaves
 private_key = rsa.generate_private_key(
@@ -42,36 +47,54 @@ def main():
     print("Alice se ha conectado")
 
     # Handshake
-    encrypted = base64.b64encode(public_partner.encrypt(b'hello',
+    encrypted = public_partner.encrypt(b'hello',
                                 padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
                                                               algorithm=hashes.SHA256(),
                                                               label=None)
                                                              )
-                                 )
-
     try:
         client.send(encrypted)
     except Exception as e:
         print(f"Error {e}")
 
+    # Clave de sesion
+    enc_session_key = client.recv(1024)
+    session_key = private_key.decrypt(enc_session_key,
+                                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                 algorithm=hashes.SHA256(),
+                                                 label=None
+                                                 )
+                                    )
+
     # Hilos para enviar mensajes
-    send_thread = threading.Thread(target=sending_messages, args=(client,))
-    recv_thread = threading.Thread(target=receiving_messages, args=(client,))
+    send_thread = threading.Thread(target=sending_messages, args=(client, session_key))
+    recv_thread = threading.Thread(target=receiving_messages, args=(client, session_key))
     send_thread.start()
     recv_thread.start()
 
 
 # Maneja comportamiento para recibir mensajes
-def receiving_messages(c):
+def receiving_messages(c, session_key):
     while True:
         msg = c.recv(1024)
-        decrypted = private_key.decrypt(base64.b64decode(msg),
+
+        # Nonce
+        cipher = AES.new(session_key, AES.MODE_GCM, msg[:16])
+
+        try:
+            # Se obtiene el ciphertext y el tag
+            dec = cipher.decrypt_and_verify(msg[16:-16], msg[-16:])
+        except ValueError:
+            print("Fallo en desencriptacion")
+
+        decrypted = private_key.decrypt(dec,
                                         padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
                                                      algorithm=hashes.SHA256(),
                                                      label=None
                                                      )
                                         )
         decrypted_str = decrypted.decode()
+
         if decrypted_str == "salir":
             print("Alice se ha desconectado")
             c.send("salir".encode())
@@ -80,21 +103,25 @@ def receiving_messages(c):
         print("Alice: " + decrypted_str)
 
 # Maneja envio de mensajes
-def sending_messages(c):
+def sending_messages(c, session_key):
     while True:
         print()
         message = input("Yo: ")
-        encrypted = base64.b64encode(public_partner.encrypt(message.encode(),
+        encrypted = public_partner.encrypt(message.encode(),
                                     padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
                                                                   algorithm=hashes.SHA256(),
                                                                   label=None)
-                                                                  )
-                                     )
+                                                                 )
+        # Nonce
+        cipher = AES.new(session_key, AES.MODE_GCM)
+        ciphertext, tag = cipher.encrypt_and_digest(encrypted)
+        enc = cipher.nonce + ciphertext + tag
+
         if message.lower() == "salir":
-            c.send(encrypted)
+            c.send(enc)
             break
 
-        c.send(encrypted)
+        c.send(enc)
 
 if __name__ == "__main__":
     main()
