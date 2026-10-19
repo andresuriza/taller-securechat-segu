@@ -20,7 +20,7 @@ private_key = rsa.generate_private_key(
 )
 public_key = private_key.public_key()
 
-public_partner = None
+server_pkey = None
 
 # Conexion con server
 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -36,7 +36,7 @@ public_pem = public_key.public_bytes(
 client.send(public_pem)
 
 # Carga llave publica de cliente
-public_partner = serialization.load_pem_public_key(
+server_pkey = serialization.load_pem_public_key(
         client.recv(1024),
         backend=default_backend()
     )
@@ -47,7 +47,7 @@ def main():
     print("Alice se ha conectado")
 
     # Handshake
-    encrypted = public_partner.encrypt(b'hello',
+    encrypted = server_pkey.encrypt(b'hello',
                                 padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
                                                               algorithm=hashes.SHA256(),
                                                               label=None)
@@ -76,52 +76,61 @@ def main():
 # Maneja comportamiento para recibir mensajes
 def receiving_messages(c, session_key):
     while True:
-        msg = c.recv(1024)
+        enc_msg = c.recv(1024)
 
         # Nonce
-        cipher = AES.new(session_key, AES.MODE_GCM, msg[:16])
+        cipher = AES.new(session_key, AES.MODE_GCM, enc_msg[:16])
 
         try:
             # Se obtiene el ciphertext y el tag
-            dec = cipher.decrypt_and_verify(msg[16:-16], msg[-16:])
+            rsa_enc = cipher.decrypt_and_verify(enc_msg[16:-16], enc_msg[-16:])
         except ValueError:
             print("Fallo en desencriptacion")
 
-        decrypted = private_key.decrypt(dec,
+        # Desencriptar con RSA
+        msg = private_key.decrypt(rsa_enc,
                                         padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
                                                      algorithm=hashes.SHA256(),
                                                      label=None
                                                      )
                                         )
-        decrypted_str = decrypted.decode()
 
-        if decrypted_str == "salir":
+        # Convertir de bytes a string
+        msg_str = msg.decode()
+
+        # Manejo de terminacion
+        if msg_str == "salir":
             print("Alice se ha desconectado")
             c.send("salir".encode())
             break
+
         print()
-        print("Alice: " + decrypted_str)
+        print("Alice: " + msg_str)
 
 # Maneja envio de mensajes
 def sending_messages(c, session_key):
     while True:
         print()
-        message = input("Yo: ")
-        encrypted = public_partner.encrypt(message.encode(),
+        msg = input("Yo: ")
+
+        rsa_enc = server_pkey.encrypt(msg.encode(),
                                     padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
                                                                   algorithm=hashes.SHA256(),
                                                                   label=None)
                                                                  )
         # Nonce
         cipher = AES.new(session_key, AES.MODE_GCM)
-        ciphertext, tag = cipher.encrypt_and_digest(encrypted)
-        enc = cipher.nonce + ciphertext + tag
+        ciphertext, tag = cipher.encrypt_and_digest(rsa_enc)
 
-        if message.lower() == "salir":
-            c.send(enc)
+        # Mensaje encriptado con AES256-GCM
+        msg_enc = cipher.nonce + ciphertext + tag
+
+        # Manejo de terminacion chat
+        if msg.lower() == "salir":
+            c.send(msg_enc)
             break
 
-        c.send(enc)
+        c.send(msg_enc)
 
 if __name__ == "__main__":
     main()
