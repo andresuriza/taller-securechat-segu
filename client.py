@@ -1,136 +1,198 @@
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from Cryptodome.Cipher import AES
-from Cryptodome.Protocol.KDF import scrypt
-from Cryptodome.Util.number import long_to_bytes
 import socket
+import hashlib
+import struct
 import threading
-import base64
-import sys
 
-# Manejar conexion y envio de llaves
-private_key = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=4096,
-    backend=default_backend()
-)
-public_key = private_key.public_key()
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-server_pkey = None
+HOST = "localhost"
+PORT = 9999
 
-# Conexion con server
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect(("localhost", 9999))
-
-# Se prepara PEM de llave publica
-public_pem = public_key.public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo
+OAEP = padding.OAEP(
+    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+    algorithm=hashes.SHA256(),
+    label=None,
 )
 
-# Se envia llave publica a cliente
-client.send(public_pem)
-
-# Carga llave publica de cliente
-server_pkey = serialization.load_pem_public_key(
-        client.recv(1024),
-        backend=default_backend()
-    )
+ME, PEER = "Bob", "Alice"
 
 def main():
-    print("Bienvenido a Securechat 1.0")
+    print("Bienvenido a Securechat 1.0 (Bob - cliente)")
+    private_key = generate_keypair()  # la llave privada nunca sale de este proceso
+
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    conn.connect((HOST, PORT))
+    print(f"Conectado con {PEER}")
+
+    # Handshake: intercambio de llaves publicas
+    exchange_public_keys(conn, private_key, send_first=False)
+
+    # Recibe la clave de sesion cifrada con su llave publica
+    session_key = private_key.decrypt(recv_frame(conn), OAEP)
+    print("[HANDSHAKE] Clave de sesion recibida y descifrada con mi llave privada")
+
+    channel = SecureChannel(session_key, my_role=b"BOB_", peer_role=b"ALIC")
+
+    # Confirmacion cifrada con la clave de sesion
+    send_frame(conn, channel.encrypt(b"hello"))
+
+    print("[SESION SEGURA ESTABLECIDA] AES-256-GCM activo")
     print("Escribe tu mensaje o 'salir' para terminar")
-    print("Alice se ha conectado")
+    chat(conn, channel, ME, PEER)
 
-    # Handshake
-    encrypted = server_pkey.encrypt(b'hello',
-                                padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                              algorithm=hashes.SHA256(),
-                                                              label=None)
-                                                             )
-    try:
-        client.send(encrypted)
-    except Exception as e:
-        print(f"Error {e}")
+# ---------- Transporte con framing (prefijo de 4 bytes con la longitud) ----------
 
-    # Clave de sesion
-    enc_session_key = client.recv(1024)
-    session_key = private_key.decrypt(enc_session_key,
-                                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                 algorithm=hashes.SHA256(),
-                                                 label=None
-                                                 )
-                                    )
-
-    # Hilos para enviar mensajes
-    send_thread = threading.Thread(target=sending_messages, args=(client, session_key))
-    recv_thread = threading.Thread(target=receiving_messages, args=(client, session_key))
-    send_thread.start()
-    recv_thread.start()
+def send_frame(sock, data):
+    sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-# Maneja comportamiento para recibir mensajes
-def receiving_messages(c, session_key):
-    while True:
-        enc_msg = c.recv(1024)
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Conexion cerrada por el otro extremo")
+        buf += chunk
+    return buf
 
-        # Nonce
-        cipher = AES.new(session_key, AES.MODE_GCM, enc_msg[:16])
 
+def recv_frame(sock):
+    (length,) = struct.unpack(">I", recv_exact(sock, 4))
+    return recv_exact(sock, length)
+
+
+# ---------- Claves asimetricas ----------
+
+def generate_keypair():
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def public_pem(private_key):
+    return private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def fingerprint(pem):
+    return hashlib.sha256(pem).hexdigest()[:16]
+
+
+def exchange_public_keys(sock, private_key, send_first):
+    """Intercambia llaves publicas (solo la publica viaja por el socket)."""
+    mine = public_pem(private_key)
+    if send_first:
+        send_frame(sock, mine)
+        theirs = recv_frame(sock)
+    else:
+        theirs = recv_frame(sock)
+        send_frame(sock, mine)
+    peer_key = serialization.load_pem_public_key(theirs)
+    print(f"[HANDSHAKE] Huella de mi llave publica : {fingerprint(mine)}")
+    print(f"[HANDSHAKE] Huella de llave publica peer: {fingerprint(theirs)}")
+    return peer_key
+
+
+# ---------- Canal seguro AES-256-GCM ----------
+
+class SecureChannel:
+    """AES-256-GCM. Nonce de 12 bytes = prefijo de rol (4) + contador (8).
+
+    Cada rol usa un prefijo distinto y un contador creciente, asi un nonce
+    nunca se repite bajo la misma clave. El receptor exige contadores
+    estrictamente crecientes (rechaza repeticiones). El rol del emisor va
+    como AAD para impedir que un mensaje se refleje hacia su emisor.
+    """
+
+    def __init__(self, key, my_role, peer_role):
+        self.aead = AESGCM(key)
+        self.my_role = my_role      # b"ALIC" o b"BOB_"
+        self.peer_role = peer_role
+        self.send_counter = 0
+        self.recv_counter = -1
+        self.lock = threading.Lock()
+
+    def encrypt(self, plaintext):
+        with self.lock:
+            nonce = self.my_role + struct.pack(">Q", self.send_counter)
+            self.send_counter += 1
+        ct_and_tag = self.aead.encrypt(nonce, plaintext, self.my_role)
+        return nonce + ct_and_tag  # nonce(12) || ciphertext || tag(16)
+
+    def decrypt(self, data):
+        """Devuelve el plaintext, o lanza ValueError si no es valido."""
+        if len(data) < 12 + 16:
+            raise ValueError("mensaje demasiado corto")
+        nonce, ct_and_tag = data[:12], data[12:]
+        if nonce[:4] != self.peer_role:
+            raise ValueError("nonce con prefijo de rol invalido")
+        (counter,) = struct.unpack(">Q", nonce[4:])
+        if counter <= self.recv_counter:
+            raise ValueError("nonce repetido (posible replay)")
         try:
-            # Se obtiene el ciphertext y el tag
-            rsa_enc = cipher.decrypt_and_verify(enc_msg[16:-16], enc_msg[-16:])
-        except ValueError:
-            print("Fallo en desencriptacion")
+            plaintext = self.aead.decrypt(nonce, ct_and_tag, self.peer_role)
+        except InvalidTag:
+            raise ValueError("authentication tag invalido")
+        self.recv_counter = counter
+        return plaintext
 
-        # Desencriptar con RSA
-        msg = private_key.decrypt(rsa_enc,
-                                        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                     algorithm=hashes.SHA256(),
-                                                     label=None
-                                                     )
-                                        )
 
-        # Convertir de bytes a string
-        msg_str = msg.decode()
+# ---------- Chat ----------
 
-        # Manejo de terminacion
-        if msg_str == "salir":
-            print("Alice se ha desconectado")
-            c.send("salir".encode())
-            break
+def chat(sock, channel, my_name, peer_name):
+    """Receptor en el hilo principal, emisor en un hilo aparte."""
+    done = threading.Event()
 
-        print()
-        print("Alice: " + msg_str)
+    def sender():
+        try:
+            while not done.is_set():
+                msg = input(f"\n{my_name} > ")
+                if done.is_set():
+                    break
+                if not msg:
+                    continue
+                print(f"[LOCAL]     plaintext : {msg}")
+                frame = channel.encrypt(msg.encode())
+                print(f"[ENVIADO]   ciphertext: {frame.hex()}")
+                send_frame(sock, frame)
+                if msg.strip().lower() == "salir":
+                    print("[SESION] Has terminado la sesion.")
+                    done.set()
+                    break
+        except (EOFError, OSError):
+            done.set()
+        finally:
+            try:
+                sock.shutdown(2)
+            except OSError:
+                pass
 
-# Maneja envio de mensajes
-def sending_messages(c, session_key):
-    while True:
-        print()
-        msg = input("Yo: ")
+    threading.Thread(target=sender, daemon=True).start()
 
-        rsa_enc = server_pkey.encrypt(msg.encode(),
-                                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                                  algorithm=hashes.SHA256(),
-                                                                  label=None)
-                                                                 )
-        # Nonce
-        cipher = AES.new(session_key, AES.MODE_GCM)
-        ciphertext, tag = cipher.encrypt_and_digest(rsa_enc)
-
-        # Mensaje encriptado con AES256-GCM
-        msg_enc = cipher.nonce + ciphertext + tag
-
-        # Manejo de terminacion chat
-        if msg.lower() == "salir":
-            c.send(msg_enc)
-            break
-
-        c.send(msg_enc)
+    try:
+        while not done.is_set():
+            frame = recv_frame(sock)
+            print(f"\n[RECIBIDO]  ciphertext: {frame.hex()}")
+            try:
+                plaintext = channel.decrypt(frame).decode()
+            except ValueError as e:
+                print(f"[RECHAZADO] Mensaje descartado: {e}")
+                continue
+            print(f"[VERIFICADO] plaintext recuperado de {peer_name}: {plaintext}")
+            if plaintext.strip().lower() == "salir":
+                print(f"[SESION] {peer_name} ha terminado la sesion.")
+                done.set()
+                break
+            print(f"\n{my_name} > ", end="", flush=True)
+    except (ConnectionError, OSError):
+        if not done.is_set():
+            print("\n[SESION] Conexion cerrada.")
+    finally:
+        done.set()
+        sock.close()
 
 if __name__ == "__main__":
     main()
