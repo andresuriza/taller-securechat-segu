@@ -9,6 +9,13 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# Colores terminal
+RED     = '\033[31m'
+GREEN   = '\033[32m'
+YELLOW  = '\033[33m'
+BLUE    = '\033[34m'
+NORMAL = '\033[0m'
+
 # Constantes de conexion
 class ConnectionDetails:
     def __init__(self, PORT, ME, PEER):
@@ -83,7 +90,7 @@ def main():
     # Clave de sesion aleatoria (256 bits), cifrada con RSA-OAEP hacia peer
     session_key = AESGCM.generate_key(bit_length=256)
     send_frame(conn, client_pkey.encrypt(session_key, this_conn.OAEP))
-    print("[HANDSHAKE] Clave de sesion generada y enviada cifrada con RSA-OAEP")
+    print(YELLOW,"[HANDSHAKE]",NORMAL,"Clave de sesion generada y enviada cifrada con RSA-OAEP")
 
     channel = SecureChannel(session_key, my_role=b"ALIC", peer_role=b"BOB_")
 
@@ -97,7 +104,7 @@ def main():
         print("Error: handshake fallido")
         sys.exit(1)
 
-    print("[SESION SEGURA ESTABLECIDA] AES-256-GCM activo")
+    print("Sesion segura establecida, AES-256-GCM activo")
     print(f"Conectado con {this_conn.PEER}. Escribe tu mensaje o 'salir' para terminar")
     chat(conn, channel, this_conn.ME, this_conn.PEER)
 
@@ -112,12 +119,12 @@ def chat(sock, channel, my_name, peer_name):
                     break
                 if not msg:
                     continue
-                print(f"[LOCAL]     plaintext : {msg}")
+                print(BLUE,"[LOCAL]",NORMAL,f"plaintext : {msg}")
                 frame = channel.encrypt(msg.encode())
-                print(f"[ENVIADO]   ciphertext: {frame.hex()}")
+                print(BLUE,"[ENVIADO]",NORMAL,f"ciphertext: {frame.hex()}")
                 send_frame(sock, frame)
                 if msg.strip().lower() == "salir":
-                    print("[SESION] Has terminado la sesion.")
+                    print(YELLOW,"[SESION]",NORMAL,"Has terminado la sesion.")
                     done.set()
                     break
         except (EOFError, OSError):
@@ -133,21 +140,21 @@ def chat(sock, channel, my_name, peer_name):
     try:
         while not done.is_set():
             frame = recv_frame(sock)
-            print(f"\n[RECIBIDO]  ciphertext: {frame.hex()}")
+            print(BLUE,f"\n[RECIBIDO]",NORMAL,f"ciphertext: {frame.hex()}")
             try:
                 plaintext = channel.decrypt(frame).decode()
             except ValueError as e:
-                print(f"[RECHAZADO] Mensaje descartado: {e}")
+                print(RED,f"[RECHAZADO]",NORMAL,f"Mensaje descartado: {e}")
                 continue
-            print(f"[VERIFICADO] plaintext recuperado de {peer_name}: {plaintext}")
+            print(GREEN,"[VERIFICADO]",NORMAL,f"plaintext recuperado de {peer_name}: {plaintext}")
             if plaintext.strip().lower() == "salir":
-                print(f"[SESION] {peer_name} ha terminado la sesion.")
+                print(f"{peer_name} ha terminado la sesion.")
                 done.set()
                 break
             print(f"\n{my_name} > ", end="", flush=True)
     except (ConnectionError, OSError):
         if not done.is_set():
-            print("\n[SESION] Conexion cerrada.")
+            print(YELLOW,"\n[SESION]",NORMAL,"Conexion cerrada.")
     finally:
         done.set()
         sock.close()
@@ -161,8 +168,8 @@ def exchange_public_keys(sock, private_key, send_first):
         theirs = recv_frame(sock)
         send_frame(sock, mine)
     peer_key = serialization.load_pem_public_key(theirs)
-    print(f"[HANDSHAKE] Huella de mi llave publica : {fingerprint(mine)}")
-    print(f"[HANDSHAKE] Huella de llave publica peer: {fingerprint(theirs)}")
+    print(YELLOW,"[HANDSHAKE]",NORMAL,f"Huella de mi llave publica : {fingerprint(mine)}")
+    print(YELLOW,"[HANDSHAKE]",NORMAL,f"Huella de llave publica peer: {fingerprint(theirs)}")
     return peer_key
 
 def fingerprint(pem):
