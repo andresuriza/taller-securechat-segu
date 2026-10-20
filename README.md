@@ -21,4 +21,7 @@ Chat TCP que utiliza criptografia simetrica y asimetrica para proteger mensajes
 
 - Comienza a hablar en el chat
 
+<img width="1891" height="455" alt="image" src="https://github.com/user-attachments/assets/e492c39c-499d-4da5-944a-3e73487b8fc9" />
+
+
 ### Escribe 'salir' para terminar
