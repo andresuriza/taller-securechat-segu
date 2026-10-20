@@ -1,6 +1,6 @@
+import hashlib
 import socket
 import sys
-import hashlib
 import struct
 import threading
 
@@ -9,137 +9,31 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-HOST = "localhost"
-PORT = 9999
+# Constantes de conexion
+class ConnectionDetails:
+    def __init__(self, PORT, ME, PEER):
+        self.HOST = "localhost"
+        self.PORT = PORT
+        self.OAEP = padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        )
+        self.ME = ME
+        self.PEER = PEER
 
-OAEP = padding.OAEP(
-    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-    algorithm=hashes.SHA256(),
-    label=None,
-)
-ME, PEER = "Alice", "Bob"
-
-
-def main():
-    print("Bienvenido a Securechat 1.0 (Alice - servidor)")
-    private_key = generate_keypair()  # la llave privada nunca sale de este proceso
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(1)
-    print(f"Esperando conexion en {HOST}:{PORT}...")
-    conn, _ = server.accept()
-    server.close()
-    print(f"{PEER} se ha conectado")
-
-    # Handshake: intercambio de llaves publicas
-    client_pkey = exchange_public_keys(conn, private_key, send_first=True)
-
-    # Clave de sesion aleatoria (256 bits), cifrada con RSA-OAEP hacia Bob
-    from common import OAEP
-    session_key = AESGCM.generate_key(bit_length=256)
-    send_frame(conn, client_pkey.encrypt(session_key, OAEP))
-    print("[HANDSHAKE] Clave de sesion generada y enviada cifrada con RSA-OAEP")
-
-    channel = SecureChannel(session_key, my_role=b"ALIC", peer_role=b"BOB_")
-
-    # Confirmacion: Bob debe demostrar que obtuvo la misma clave
-    try:
-        confirm = channel.decrypt(recv_frame(conn))
-    except ValueError as e:
-        print(f"Error: handshake fallido ({e})")
-        sys.exit(1)
-    if confirm != b"hello":
-        print("Error: handshake fallido")
-        sys.exit(1)
-
-    print("[SESION SEGURA ESTABLECIDA] AES-256-GCM activo")
-    print(f"Conectado con {PEER}. Escribe tu mensaje o 'salir' para terminar")
-    chat(conn, channel, ME, PEER)
-
-
-# ---------- Transporte con framing (prefijo de 4 bytes con la longitud) ----------
-
-def send_frame(sock, data):
-    sock.sendall(struct.pack(">I", len(data)) + data)
-
-
-def recv_exact(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Conexion cerrada por el otro extremo")
-        buf += chunk
-    return buf
-
-
-def recv_frame(sock):
-    (length,) = struct.unpack(">I", recv_exact(sock, 4))
-    return recv_exact(sock, length)
-
-
-# ---------- Claves asimetricas ----------
-
-def generate_keypair():
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-
-def public_pem(private_key):
-    return private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-
-
-def fingerprint(pem):
-    return hashlib.sha256(pem).hexdigest()[:16]
-
-
-def exchange_public_keys(sock, private_key, send_first):
-    """Intercambia llaves publicas (solo la publica viaja por el socket)."""
-    mine = public_pem(private_key)
-    if send_first:
-        send_frame(sock, mine)
-        theirs = recv_frame(sock)
-    else:
-        theirs = recv_frame(sock)
-        send_frame(sock, mine)
-    peer_key = serialization.load_pem_public_key(theirs)
-    print(f"[HANDSHAKE] Huella de mi llave publica : {fingerprint(mine)}")
-    print(f"[HANDSHAKE] Huella de llave publica peer: {fingerprint(theirs)}")
-    return peer_key
-
-
-# ---------- Canal seguro AES-256-GCM ----------
-
+# Canal seguro SHA256
 class SecureChannel:
-    """AES-256-GCM. Nonce de 12 bytes = prefijo de rol (4) + contador (8).
-
-    Cada rol usa un prefijo distinto y un contador creciente, asi un nonce
-    nunca se repite bajo la misma clave. El receptor exige contadores
-    estrictamente crecientes (rechaza repeticiones). El rol del emisor va
-    como AAD para impedir que un mensaje se refleje hacia su emisor.
-    """
-
     def __init__(self, key, my_role, peer_role):
         self.aead = AESGCM(key)
-        self.my_role = my_role      # b"ALIC" o b"BOB_"
+        self.my_role = my_role
         self.peer_role = peer_role
         self.send_counter = 0
         self.recv_counter = -1
         self.lock = threading.Lock()
 
-    def encrypt(self, plaintext):
-        with self.lock:
-            nonce = self.my_role + struct.pack(">Q", self.send_counter)
-            self.send_counter += 1
-        ct_and_tag = self.aead.encrypt(nonce, plaintext, self.my_role)
-        return nonce + ct_and_tag  # nonce(12) || ciphertext || tag(16)
-
+    # Devuelve el plaintext
     def decrypt(self, data):
-        """Devuelve el plaintext, o lanza ValueError si no es valido."""
         if len(data) < 12 + 16:
             raise ValueError("mensaje demasiado corto")
         nonce, ct_and_tag = data[:12], data[12:]
@@ -155,11 +49,59 @@ class SecureChannel:
         self.recv_counter = counter
         return plaintext
 
+    # Cifrado de plaintext a enviar
+    def encrypt(self, plaintext):
+        with self.lock:
+            nonce = self.my_role + struct.pack(">Q", self.send_counter)
+            self.send_counter += 1
+        ct_and_tag = self.aead.encrypt(nonce, plaintext, self.my_role)
 
-# ---------- Chat ----------
+        # nonce(12) | ciphertext | tag(16)
+        return nonce + ct_and_tag
+
+def main():
+    this_conn = ConnectionDetails(9999, "Alice", "Bob")
+
+    print("Bienvenido a Securechat 1.0")
+    print(f"Usuario: {this_conn.ME}")
+
+    # La llave privada nunca sale de este proceso
+    private_key = generate_keypair()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((this_conn.HOST, this_conn.PORT))
+    server.listen(1)
+    print(f"Esperando conexion en {this_conn.HOST}:{this_conn.PORT}...")
+    conn, _ = server.accept()
+    server.close()
+    print(f"{this_conn.PEER} se ha conectado")
+
+    # Handshake: intercambio de llaves publicas
+    client_pkey = exchange_public_keys(conn, private_key, send_first=True)
+
+    # Clave de sesion aleatoria (256 bits), cifrada con RSA-OAEP hacia peer
+    session_key = AESGCM.generate_key(bit_length=256)
+    send_frame(conn, client_pkey.encrypt(session_key, this_conn.OAEP))
+    print("[HANDSHAKE] Clave de sesion generada y enviada cifrada con RSA-OAEP")
+
+    channel = SecureChannel(session_key, my_role=b"ALIC", peer_role=b"BOB_")
+
+    # Confirmacion: Peer debe demostrar que obtuvo la misma clave
+    try:
+        confirm = channel.decrypt(recv_frame(conn))
+    except ValueError as e:
+        print(f"Error: handshake fallido ({e})")
+        sys.exit(1)
+    if confirm != b"hello":
+        print("Error: handshake fallido")
+        sys.exit(1)
+
+    print("[SESION SEGURA ESTABLECIDA] AES-256-GCM activo")
+    print(f"Conectado con {this_conn.PEER}. Escribe tu mensaje o 'salir' para terminar")
+    chat(conn, channel, this_conn.ME, this_conn.PEER)
 
 def chat(sock, channel, my_name, peer_name):
-    """Receptor en el hilo principal, emisor en un hilo aparte."""
     done = threading.Event()
 
     def sender():
@@ -209,6 +151,50 @@ def chat(sock, channel, my_name, peer_name):
     finally:
         done.set()
         sock.close()
+
+def exchange_public_keys(sock, private_key, send_first):
+    mine = public_pem(private_key)
+    if send_first:
+        send_frame(sock, mine)
+        theirs = recv_frame(sock)
+    else:
+        theirs = recv_frame(sock)
+        send_frame(sock, mine)
+    peer_key = serialization.load_pem_public_key(theirs)
+    print(f"[HANDSHAKE] Huella de mi llave publica : {fingerprint(mine)}")
+    print(f"[HANDSHAKE] Huella de llave publica peer: {fingerprint(theirs)}")
+    return peer_key
+
+def fingerprint(pem):
+    return hashlib.sha256(pem).hexdigest()[:16]
+
+# Claves asimetricas
+def generate_keypair():
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+def public_pem(private_key):
+    return private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Conexion cerrada por el otro extremo")
+        buf += chunk
+    return buf
+
+def recv_frame(sock):
+    (length,) = struct.unpack(">I", recv_exact(sock, 4))
+    return recv_exact(sock, length)
+
+# Transporte con framing (4 bytes con longitud)
+def send_frame(sock, data):
+    sock.sendall(struct.pack(">I", len(data)) + data)
+
 
 if __name__ == "__main__":
     main()
